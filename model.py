@@ -68,9 +68,10 @@ class KVCache(nn.Module):
     def update(self, input_pos, k_val, v_val):
         # input_pos: [S], k_val: [B, H, S, D]
         assert input_pos.shape[0] == k_val.shape[2]
+        B = k_val.size(0)
 
-        k_out = self.k_cache
-        v_out = self.v_cache
+        k_out = self.k_cache[:B, ...]
+        v_out = self.v_cache[:B, ...]
         k_out[:, :, input_pos] = k_val
         v_out[:, :, input_pos] = v_val
 
@@ -104,11 +105,30 @@ class Transformer(nn.Module):
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
-    def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None, padding: Optional[Tensor] = None) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
-        mask = self.causal_mask[None, None, input_pos]
-        freqs_cis = self.freqs_cis[input_pos]
+        
         x = self.tok_embeddings(idx)
+        
+        if padding is not None:
+            bsz, seqlen = idx.shape
+            seqlen_with_past = seqlen + input_pos
+            mask = torch.full(
+                (bsz, 1, 1, self.max_seq_length),
+                0,
+                dtype = torch.bool,
+                device=self.causal_mask.device,
+            )
+            mask_cond = torch.arange(mask.size(-1), device=mask.device)
+            # We use -0.1 here for masking as we get different results for
+            # padding and non padding with torch.nn.functional.scaled_dot_product_attention if we use 0
+            # Not reproducible with small example snippet (numerical accumulation through layers?)
+            # TODO: figure out why
+            mask.masked_fill_(mask_cond + 1 > padding.view(-1, 1, 1, 1), 1)
+            mask[:,:,:,seqlen_with_past:] = 0
+        else:
+            mask = self.causal_mask[None, None, input_pos]
+        freqs_cis = self.freqs_cis[input_pos]
 
         for i, layer in enumerate(self.layers):
             x = layer(x, input_pos, freqs_cis, mask)
@@ -169,16 +189,17 @@ class Attention(nn.Module):
         k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.n_local_heads, self.head_dim)
 
-        q = apply_rotary_emb(q, freqs_cis)
-        k = apply_rotary_emb(k, freqs_cis)
-
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
-
+        
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
-
+            
+        q = apply_rotary_emb(q, freqs_cis)
+        k = apply_rotary_emb(k, freqs_cis)
+        
         k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+        
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
@@ -224,7 +245,10 @@ def precompute_freqs_cis(
 
 
 def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
+    print(f"{x.shape=}")
+    print(f"{freqs_cis.shape=}")
     xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
+    print(f"{xshaped.shape=}")
     freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
     x_out2 = torch.stack(
         [
